@@ -6,6 +6,16 @@
 .ipynb_checkpoints
 results/
 models/
+
+# Local environments and editor configs
+.venv/
+venv/
+.claude/
+
+# Local input/output not meant to be tracked
+data/generated/
+data/client_inputs/
+avatar4university/
 **/__pycache__/
 *.py[cod]
 *$py.class
