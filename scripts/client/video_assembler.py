@@ -4,6 +4,7 @@ concatenate with re-encoding, trim to exact duration."""
 from __future__ import annotations
 
 import json
+import math
 import random
 import shutil
 import subprocess
@@ -20,6 +21,7 @@ def _run(cmd: list[str], *, capture: bool = True) -> subprocess.CompletedProcess
         check=True,
         capture_output=capture,
         text=True,
+        stdin=subprocess.DEVNULL,
     )
 
 
@@ -35,6 +37,35 @@ def probe_duration(video_path: Path) -> float:
     out = (p.stdout or "").strip()
     if not out:
         raise RuntimeError(f"ffprobe returned empty duration for {video_path}")
+    return float(out)
+
+
+def probe_fps(video_path: Path) -> float:
+    """Return the source video's native frame rate (e.g. 24.0 for 24fps clips).
+
+    Needed because if a clip is 24fps but the assembled video targets 25fps,
+    ffmpeg duplicates frames to fill the gap; the per-clip cache (latents,
+    parsing, bboxes) stores only the 24fps native frames, so the assembled
+    timeline must be mapped back via the source/target ratio.
+    """
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=r_frame_rate",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+    p = _run(cmd)
+    out = (p.stdout or "").strip()
+    if not out:
+        raise RuntimeError(f"ffprobe returned empty fps for {video_path}")
+    if "/" in out:
+        num, den = out.split("/")
+        den_f = float(den)
+        if den_f == 0:
+            raise RuntimeError(f"ffprobe returned zero denominator for {video_path}: {out}")
+        return float(num) / den_f
     return float(out)
 
 
@@ -106,7 +137,8 @@ def concat_clips_reencode(
     n = len(clip_paths)
     norm_chains = [
         f"[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
-        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={target_fps},format=yuv420p[v{i}]"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+        f"fps={target_fps}:round=up,format=yuv420p[v{i}]"
         for i in range(n)
     ]
     concat_inputs = "".join(f"[v{i}]" for i in range(n))
@@ -178,6 +210,7 @@ def build_random_video(
 
     clips = list_clips(clips_dir)
     durations = {c: probe_duration(c) for c in clips}
+    source_fps_map = {c: probe_fps(c) for c in clips}
 
     sampled = sample_clips_until_duration(clips, durations, target_seconds, rng)
 
@@ -201,13 +234,24 @@ def build_random_video(
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     actual = probe_duration(output_path)
+    total_frames = max(1, int(round(actual * target_fps)))
+    frame_to_clip, frame_to_clip_idx = _build_frame_to_clip_map(
+        sampled, durations, source_fps_map, target_fps, total_frames
+    )
     build_time = time.perf_counter() - t0
+
+    unique_clips = list(dict.fromkeys(str(p) for p in sampled))
 
     return {
         "total_clips_input": len(clips),
         "input_clip_durations_s": {str(p): durations[p] for p in clips},
+        "input_clip_source_fps": {str(p): source_fps_map[p] for p in clips},
         "sampled_clips": [str(p) for p in sampled],
         "sampled_count": len(sampled),
+        "unique_clips_used": unique_clips,
+        "frame_to_clip": [str(p) for p in frame_to_clip],
+        "frame_to_clip_idx": frame_to_clip_idx,
+        "total_frames": total_frames,
         "target_duration_s": target_seconds,
         "actual_duration_s": actual,
         "target_fps": target_fps,
@@ -216,3 +260,67 @@ def build_random_video(
         "build_time_s": build_time,
         "output_path": str(output_path.resolve()),
     }
+
+
+def _build_frame_to_clip_map(
+    sampled: list[Path],
+    durations: dict[Path, float],
+    source_fps_map: dict[Path, float],
+    target_fps: int,
+    total_frames: int,
+) -> tuple[list[Path], list[int]]:
+    """Return two parallel lists of length ``total_frames``:
+
+    - ``frame_to_clip``: per-frame source clip path
+    - ``frame_to_clip_idx``: per-frame index *within that clip's native
+      timeline* (0-based, in the clip's source fps).
+
+    Cumulative tracking is in **frame counts** (integer), not seconds. The
+    ffmpeg filter ``fps={target_fps}:round=up`` applied in
+    :func:`concat_clips_reencode` produces exactly ``ceil(duration *
+    target_fps)`` frames per clip in the assembled stream. Tracking the
+    same integer here keeps client and ffmpeg perfectly aligned — fixes
+    the ~13-frame (520 ms) cumulative drift at end-of-video observed in
+    v7's `cumulative_s` arithmetic over 160 clips.
+
+    For a clip at 24 fps assembled into a 25 fps stream, the segment
+    occupies ``ceil(5.917 × 25) = 148`` frames; per-frame source idx is
+    ``int(local_target_frame * source_fps / target_fps)`` clamped to
+    ``n_native - 1``, mirroring ffmpeg's per-frame nearest-neighbor
+    duplication.
+    """
+    if not sampled or total_frames <= 0:
+        return [], []
+
+    clip_per_frame: list[Path | None] = [None] * total_frames
+    idx_per_frame: list[int] = [0] * total_frames
+
+    start_f = 0
+    last_clip_state: tuple[Path, int, int] | None = None  # (clip, start_f, n_native)
+    for clip in sampled:
+        if start_f >= total_frames:
+            break
+        # Must match `fps={target_fps}:round=up` in concat_clips_reencode.
+        clip_frames = math.ceil(durations[clip] * target_fps)
+        end_f = min(start_f + clip_frames, total_frames)
+        source_fps = source_fps_map[clip]
+        n_native = max(1, int(round(durations[clip] * source_fps)))
+        scale = source_fps / target_fps
+        for f in range(start_f, end_f):
+            clip_per_frame[f] = clip
+            local = f - start_f
+            idx_per_frame[f] = min(int(local * scale), n_native - 1)
+        last_clip_state = (clip, start_f, n_native)
+        start_f = end_f
+
+    # Trailing rounding remainder (rare; only if total_frames exceeds the
+    # sum of per-clip frame counts). Fall back on the last clip's last frame.
+    if last_clip_state is not None:
+        last_clip, last_start, last_n = last_clip_state
+        last_scale = source_fps_map[last_clip] / target_fps
+        for i in range(total_frames):
+            if clip_per_frame[i] is None:
+                clip_per_frame[i] = last_clip
+                local = max(0, i - last_start)
+                idx_per_frame[i] = min(int(local * last_scale), last_n - 1)
+    return clip_per_frame, idx_per_frame  # type: ignore[return-value]

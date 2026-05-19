@@ -15,7 +15,20 @@ venv/
 # Local input/output not meant to be tracked
 data/generated/
 data/client_inputs/
+data/manifests/
+data/_qa_frames/
 avatar4university/
+
+# Per-run debug output JSONs at repo root
+test_*.json
+
+# Local secrets and env files (RunPod, R2, ...)
+*.env
+.env
+.env.*
+!.env.example
+runpod_secrets*
+r2_secrets*
 **/__pycache__/
 *.py[cod]
 *$py.class

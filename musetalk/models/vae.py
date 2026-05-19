@@ -113,13 +113,64 @@ class VAE():
         :param img: The image to process.
         :return: A concatenated tensor of latents for U-Net input.
         """
-        
+
         ref_image = self.preprocess_img(img,half_mask=True) # [1, 3, 256, 256] RGB, torch tensor
         masked_latents = self.encode_latents(ref_image) # [1, 4, 32, 32], torch tensor
         ref_image = self.preprocess_img(img,half_mask=False) # [1, 3, 256, 256] RGB, torch tensor
         ref_latents = self.encode_latents(ref_image) # [1, 4, 32, 32], torch tensor
         latent_model_input = torch.cat([masked_latents, ref_latents], dim=1)
         return latent_model_input
+
+    def preprocess_img_batch(self, img_list, half_mask=False):
+        """Vectorised version of :meth:`preprocess_img` for a batch of N
+        images. Returns a tensor of shape ``[N, 3, 256, 256]`` on the VAE
+        device. ``img_list`` may contain either BGR uint8 numpy arrays
+        (whatever original H/W — they are resized to 256x256) or string paths.
+        """
+        processed = []
+        for img in img_list:
+            if isinstance(img, str):
+                img = cv2.imread(img)
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            if rgb.shape[0] != self._resized_img or rgb.shape[1] != self._resized_img:
+                rgb = cv2.resize(
+                    rgb,
+                    (self._resized_img, self._resized_img),
+                    interpolation=cv2.INTER_LANCZOS4,
+                )
+            processed.append(rgb)
+
+        x = np.asarray(processed, dtype=np.float32) / 255.0   # [N, H, W, 3]
+        x = torch.from_numpy(x).permute(0, 3, 1, 2).contiguous()  # [N, 3, H, W]
+
+        if half_mask:
+            mask = (self._mask_tensor > 0.5).to(x.dtype)      # [H, W]
+            x = x * mask.unsqueeze(0).unsqueeze(0)            # broadcast over batch + channel
+
+        x = self.transform(x)
+        return x.to(self.vae.device)
+
+    def encode_batch(self, image_tensor):
+        """Batched VAE encoding. ``image_tensor`` shape ``[N, 3, 256, 256]``,
+        returns ``[N, 4, 32, 32]``. Functionally identical to
+        :meth:`encode_latents` (which already accepts batched input) — kept
+        as an explicit name for callers that want to make the batching
+        intent clear.
+        """
+        return self.encode_latents(image_tensor)
+
+    def get_latents_for_unet_batch(self, img_list):
+        """Batched version of :meth:`get_latents_for_unet`. ``img_list`` is a
+        list of N BGR uint8 numpy arrays (any HW, will be resized). Returns
+        a tensor ``[N, 8, 32, 32]`` ready for the UNet input — the masked
+        and reference encodings are computed in two batched VAE forward
+        passes rather than 2*N single-frame forwards.
+        """
+        masked = self.preprocess_img_batch(img_list, half_mask=True)   # [N, 3, 256, 256]
+        ref = self.preprocess_img_batch(img_list, half_mask=False)     # [N, 3, 256, 256]
+        masked_latents = self.encode_batch(masked)                     # [N, 4, 32, 32]
+        ref_latents = self.encode_batch(ref)                           # [N, 4, 32, 32]
+        return torch.cat([masked_latents, ref_latents], dim=1)         # [N, 8, 32, 32]
 
 if __name__ == "__main__":
     vae_mode_path = "./models/sd-vae-ft-mse/"

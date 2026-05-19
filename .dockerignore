@@ -25,8 +25,11 @@ ENV/
 .gitignore
 .github/
 
-# Models (mounted as volume in production)
-models/
+# Models are baked into the RunPod image (musetalk_runpod/Dockerfile).
+# Do NOT exclude them here. The original api/main.py Dockerfile does not
+# COPY models/, so leaving them in the build context only costs upload
+# time for that variant — no harm done.
+# models/
 
 # Results (mounted as volume)
 results/

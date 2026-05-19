@@ -81,8 +81,35 @@ def get_bbox_range(img_list,upperbondrange =0):
     return text_range
     
 
-def get_landmark_and_bbox(img_list,upperbondrange =0):
-    frames = read_imgs(img_list)
+def get_landmark_and_bbox(img_list, upperbondrange=0, precomputed_bboxes=None, frames=None):
+    """Detect face landmarks/bboxes per frame.
+
+    ``img_list``: list of image paths (read with cv2.imread if ``frames`` is None).
+    ``frames``:   optional list of pre-loaded BGR np.ndarray. When given, skips
+                  disk reads — used by the in-memory pipeline.
+    ``precomputed_bboxes``: optional list of bbox tuples (x1, y1, x2, y2) matching
+                  the frame ordering. When given, the face-detection + landmark
+                  models are NOT run at all and the returned coord_list is just
+                  this argument verbatim. ``frames`` (or ``img_list``) is still
+                  required because the caller needs the original images.
+    """
+    if frames is None:
+        frames = read_imgs(img_list)
+
+    if precomputed_bboxes is not None:
+        # Tolerate small rounding mismatches between the client-side
+        # int(round(duration * fps)) and the actual cv2-decoded frame count.
+        n = len(frames)
+        bboxes = list(precomputed_bboxes)
+        if len(bboxes) > n:
+            bboxes = bboxes[:n]
+        elif len(bboxes) < n:
+            raise ValueError(
+                f"precomputed_bboxes length {len(bboxes)} is shorter than "
+                f"decoded frames {n}; cannot align"
+            )
+        return bboxes, frames
+
     batch_size_fa = 1
     batches = [frames[i:i + batch_size_fa] for i in range(0, len(frames), batch_size_fa)]
     coords_list = []
