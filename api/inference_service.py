@@ -128,9 +128,18 @@ class MuseTalkInference:
 
         from gfpgan import GFPGANer
 
-        print("Loading GFPGAN model...")
+        # Offline-mode friendly: HPC compute nodes have no internet, so we
+        # bake GFPGANv1.4.pth into the Singularity image and point GFPGANer
+        # at the local file via ``GFPGAN_MODEL_PATH``. Cloud / dev paths
+        # without the env var fall back to the original GitHub URL so
+        # behavior is unchanged outside HPC.
+        model_path = os.environ.get(
+            "GFPGAN_MODEL_PATH",
+            "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth",
+        )
+        print(f"Loading GFPGAN model from {model_path}")
         self.gfpgan_restorer = GFPGANer(
-            model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth",
+            model_path=model_path,
             upscale=1,
             arch="clean",
             channel_multiplier=2,

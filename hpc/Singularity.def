@@ -1,0 +1,118 @@
+Bootstrap: docker
+From: nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+
+# ============================================================================
+# MuseTalk-API Singularity image for HPC deployment (MareNostrum 5 ACC + any
+# cluster with NVIDIA driver >= 11.8 and Apptainer/Singularity).
+#
+# Build on the login node (where there is outbound internet); execute on the
+# compute nodes (which DO NOT have outbound internet).
+#
+# Recommended build command (from the repo root):
+#   SINGULARITY_TMPDIR=$SCRATCH/sing-tmp \
+#   SINGULARITY_CACHEDIR=$SCRATCH/sing-cache \
+#   singularity build $PROJECT/musetalk/musetalk-v8-hpc.sif hpc/Singularity.def
+# ============================================================================
+
+%files
+    api                                /app/api
+    musetalk                           /app/musetalk
+    scripts                            /app/scripts
+    models                             /app/models
+    download_models.py                 /app/download_models.py
+    hpc/scripts/prefetch_lazy_models.py /app/hpc/prefetch_lazy_models.py
+
+%environment
+    export MUSETALK_REPO_ROOT=/app
+    export PYTHONPATH=/app
+    export PYTHONUNBUFFERED=1
+    # Offline-mode safety: any runtime attempt to reach HuggingFace hub
+    # or external endpoints from transformers/diffusers will fail-fast
+    # instead of silently hanging on a closed compute-node firewall.
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+    export HF_DATASETS_OFFLINE=1
+    # Pre-cached weights live here (S3FD via face_alignment, GFPGAN, etc.)
+    export TORCH_HOME=/app/models/torch_hub
+    export GFPGAN_MODEL_PATH=/app/models/gfpgan/GFPGANv1.4.pth
+
+%post
+    set -euxo pipefail
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y --no-install-recommends \
+        python3.10 python3.10-dev python3-pip python3.10-venv \
+        ffmpeg libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1 \
+        ca-certificates curl && \
+        rm -rf /var/lib/apt/lists/* && apt-get clean
+
+    pip3 install --no-cache-dir --upgrade pip setuptools wheel
+
+    # PyTorch 2.0.1 + CUDA 11.8 toolkit. The host driver on MN5 is 12.2
+    # which is forward-compatible (NVIDIA driver compat guarantees toolkit
+    # version >= compiled-against, and 12.2 >= 11.8).
+    pip3 install --no-cache-dir \
+        torch==2.0.1+cu118 torchvision==0.15.2+cu118 torchaudio==2.0.2+cu118 \
+        --index-url https://download.pytorch.org/whl/cu118
+
+    # OpenMMLab stack (mmcv MUST match torch CUDA build).
+    pip3 install --no-cache-dir -U openmim
+    mim install mmengine
+    mim install "mmcv==2.0.1"
+    mim install "mmdet==3.1.0"
+    pip3 install --no-cache-dir --no-build-isolation "mmpose==1.1.0"
+
+    # MuseTalk + its dependencies.
+    pip3 install --no-cache-dir \
+        diffusers==0.30.2 accelerate==0.28.0 transformers==4.39.2 \
+        "huggingface_hub>=0.20.0" numpy==1.23.5 "scipy>=1.10.0" \
+        "librosa>=0.10.0" "soundfile>=0.12.0" "opencv-python>=4.8.0" \
+        "imageio[ffmpeg]" ffmpeg-python moviepy \
+        "gfpgan>=1.3.8" "facexlib>=0.3.0" "basicsr>=1.4.2" \
+        "realesrgan>=0.3.0" omegaconf "einops>=0.7.0" "pyyaml>=6.0" \
+        tqdm gdown requests "filterpy>=1.4.5" "lmdb>=1.4.0" \
+        "yapf>=0.40.0" "psutil>=5.9.0" boto3
+
+    # Pre-fetch lazy downloads (GFPGAN + S3FD) BEFORE the image is sealed,
+    # so they are baked in and available offline at runtime.
+    mkdir -p /app/models/gfpgan /app/models/torch_hub/checkpoints
+    cd /app && python3 hpc/prefetch_lazy_models.py
+
+    # Smoke-test offline imports: if anything tries to phone home at
+    # module-import time (transformers/diffusers/etc.) we want to catch it
+    # NOW during the build, not on the air-gapped compute node.
+    export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+    cd /app && python3 -c "from api.inference_service import MuseTalkInference; print('OK: offline import sanity check passed')"
+
+%runscript
+    exec python3 "$@"
+
+%labels
+    Project          MuseTalk-API
+    Maintainer       Michele Dibisceglia
+    Version          v8-hpc-mn5
+    PyTorch          2.0.1+cu118
+    CUDA-toolkit     11.8 (host driver 12.x compatible)
+    BaseImage        nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+
+%help
+    Singularity image for running MuseTalk-API lipsync inference offline
+    on HPC clusters. Designed primarily for MareNostrum 5 ACC (BSC).
+
+    Usage on a SLURM job (see hpc/slurm/*.sbatch):
+
+      singularity exec --nv \
+          --bind $CLIPS_DIR:/inputs/clips:ro \
+          --bind $AUDIO:/inputs/audio.wav:ro \
+          --bind $CACHE_DIR:/cache \
+          --bind $OUTPUT_DIR:/outputs \
+          musetalk-v8-hpc.sif \
+          -m scripts.client.synth_random_lipsync \
+              --backend local \
+              --clips-dir /inputs/clips --audio /inputs/audio.wav \
+              --output /outputs/final.mp4 \
+              --manifest-cache-dir /cache/manifests \
+              --seed 42 --use-nvenc
+
+    First run (cache miss): ~30 min for 15 min audio (preprocess full).
+    Subsequent runs (cache hit): ~15 min for 15 min audio.

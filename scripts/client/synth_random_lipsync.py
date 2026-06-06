@@ -1,9 +1,16 @@
 """Random-sample N short clips into a single video matching the audio duration
-(or an explicit ``--minutes`` target), then call the MuseTalk lipsync service
-on RunPod Serverless against the given audio track.
+(or an explicit ``--minutes`` target), then run MuseTalk lipsync on it.
 
-Measures wall-clock time from the moment the RunPod job is submitted to the
-moment the final MP4 is fully saved locally.
+Two backends are supported:
+- ``--backend runpod`` (default) — cloud path: upload to R2, submit RunPod
+  Serverless job, poll, download. Same behavior as before this flag existed.
+- ``--backend local`` — in-process path: load :class:`MuseTalkInference`
+  directly, no R2 / no RunPod. Cache lives on the local filesystem. Used on
+  HPC (MareNostrum 5, Leonardo, ...) under Singularity / Apptainer with
+  no outbound internet on compute nodes.
+
+Measures wall-clock time from the start of preprocessing to the moment the
+final MP4 is fully saved locally.
 """
 
 from __future__ import annotations
@@ -44,6 +51,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="synth_random_lipsync",
         description="Build a random-sampled video from N clips and lipsync it via MuseTalk on RunPod.",
     )
+    p.add_argument("--backend", default="runpod", choices=["runpod", "local"],
+                   help="Where to run the lipsync inference. 'runpod' (default) "
+                        "uploads to R2 and calls a RunPod Serverless endpoint; "
+                        "'local' loads MuseTalkInference in-process (no R2, no "
+                        "network), used on HPC clusters via Singularity.")
     p.add_argument("--clips-dir", type=Path, required=True,
                    help="Directory with N short clips (same subject)")
     p.add_argument("--audio", type=Path, required=True,
@@ -137,11 +149,12 @@ def main(argv: list[str] | None = None) -> int:
               f"Consider --fps 25 unless you know what you are doing.",
               file=sys.stderr)
 
-    try:
-        ensure_env()
-    except RunPodClientError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 3
+    if args.backend == "runpod":
+        try:
+            ensure_env()
+        except RunPodClientError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 3
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.intermediate_dir.mkdir(parents=True, exist_ok=True)
@@ -174,140 +187,169 @@ def main(argv: list[str] | None = None) -> int:
           f"actual={build_meta['actual_duration_s']:.2f}s "
           f"target={build_meta['target_duration_s']:.2f}s")
 
-    video_key = f"inputs/{run_id}/video.mp4"
-    audio_key = f"inputs/{run_id}/{args.audio.name}"
-    output_key = f"outputs/{run_id}/{args.output.name}"
-    manifest_key = f"inputs/{run_id}/manifest.json"
+    if args.backend == "runpod":
+        video_key: str | None = f"inputs/{run_id}/video.mp4"
+        audio_key: str | None = f"inputs/{run_id}/{args.audio.name}"
+        output_key: str | None = f"outputs/{run_id}/{args.output.name}"
+        manifest_key: str | None = f"inputs/{run_id}/manifest.json"
+    else:
+        video_key = audio_key = output_key = manifest_key = None
 
     start_dt = datetime.now()
     start_pc = time.perf_counter()
-    print(f"[start ]  {start_dt.isoformat()}  -> preprocess + upload + RunPod job")
+    start_label = "RunPod job" if args.backend == "runpod" else "local engine"
+    print(f"[start ]  {start_dt.isoformat()}  -> preprocess + {start_label}")
 
-    job_id = None
-    job_result = {}
+    job_id: str | None = None
+    job_result: dict = {}
     manifest_meta: dict = {}
     manifest_url: str | None = None
     bboxes_urls: dict[str, str] | None = None
     latents_urls: dict[str, str] | None = None
     parsing_urls: dict[str, str] | None = None
-    try:
-        if not args.skip_manifest:
-            unique_clip_paths = [Path(p) for p in build_meta["unique_clips_used"]]
-            frame_to_clip = build_meta["frame_to_clip"]
-            manifest_t0 = time.perf_counter()
-            if args.skip_full_preprocess:
-                print(f"[probe ]  computing/loading bbox manifest only for "
-                      f"{len(unique_clip_paths)} unique clip(s) ...")
-                per_frame_bboxes, manifest_meta = get_or_compute_manifest(
-                    unique_clips=unique_clip_paths,
-                    frame_to_clip=frame_to_clip,
-                    bbox_shift=args.bbox_shift,
-                    r2_prefix=f"probes/{run_id}",
-                    cache_dir=args.manifest_cache_dir,
-                    poll_timeout=args.preprocess_timeout_seconds,
-                )
-                local_manifest_path = (
-                    args.intermediate_dir / f"manifest_{run_id}.json"
-                )
-                local_manifest_path.write_text(
-                    json.dumps(per_frame_bboxes), encoding="utf-8"
-                )
-                manifest_url = r2_upload(local_manifest_path, manifest_key)
-                manifest_elapsed = time.perf_counter() - manifest_t0
-                origin = "cache" if manifest_meta.get("cache_hit") else "fresh"
-                print(f"[probe ]  manifest ready ({origin}) in {manifest_elapsed:.2f}s — "
-                      f"{len(per_frame_bboxes)} per-frame bboxes (legacy bbox-only path); "
-                      f"set_hash={manifest_meta.get('set_hash')}")
-                print(f"[upload]  manifest uploaded to R2 ({manifest_key})")
-            else:
-                print(f"[probe ]  computing/loading v3 FULL manifest "
-                      f"(per-frame bbox + latents + parsing) for "
-                      f"{len(unique_clip_paths)} unique clip(s) ...")
-                bboxes_urls, latents_urls, parsing_urls, manifest_meta = (
-                    get_or_compute_full_manifest(
+
+    if args.backend == "local":
+        from scripts.client.local_backend import run_lipsync_local
+
+        try:
+            job_result = run_lipsync_local(
+                args=args,
+                build_meta=build_meta,
+                intermediate_path=intermediate,
+                run_id=run_id,
+            )
+        except Exception as e:  # noqa: BLE001 — surface the underlying error
+            import traceback
+            print(f"ERROR (local backend): {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            traceback.print_exc()
+            return 4
+
+        if job_result.get("status") != "COMPLETED":
+            print(f"ERROR: local backend ended with status={job_result.get('status')}",
+                  file=sys.stderr)
+            return 4
+        manifest_meta = (job_result.get("output") or {}).get("manifest_meta", {}) or {}
+
+    elif args.backend == "runpod":
+        try:
+            if not args.skip_manifest:
+                unique_clip_paths = [Path(p) for p in build_meta["unique_clips_used"]]
+                frame_to_clip = build_meta["frame_to_clip"]
+                manifest_t0 = time.perf_counter()
+                if args.skip_full_preprocess:
+                    print(f"[probe ]  computing/loading bbox manifest only for "
+                          f"{len(unique_clip_paths)} unique clip(s) ...")
+                    per_frame_bboxes, manifest_meta = get_or_compute_manifest(
                         unique_clips=unique_clip_paths,
                         frame_to_clip=frame_to_clip,
-                        frame_to_clip_idx=build_meta["frame_to_clip_idx"],
                         bbox_shift=args.bbox_shift,
-                        extra_margin=args.extra_margin,
-                        parsing_mode=args.parsing_mode,
-                        left_cheek_width=args.left_cheek_width,
-                        right_cheek_width=args.right_cheek_width,
+                        r2_prefix=f"probes/{run_id}",
                         cache_dir=args.manifest_cache_dir,
                         poll_timeout=args.preprocess_timeout_seconds,
                     )
-                )
-                manifest_elapsed = time.perf_counter() - manifest_t0
-                origin = "cache" if manifest_meta.get("cache_hit") else "fresh"
-                print(f"[probe ]  v3 manifest ready ({origin}) in {manifest_elapsed:.2f}s — "
-                      f"{len(latents_urls)} latents + {len(parsing_urls)} parsing + "
-                      f"{len(bboxes_urls)} bbox blobs; "
-                      f"full_set_hash={manifest_meta.get('full_set_hash')}")
+                    local_manifest_path = (
+                        args.intermediate_dir / f"manifest_{run_id}.json"
+                    )
+                    local_manifest_path.write_text(
+                        json.dumps(per_frame_bboxes), encoding="utf-8"
+                    )
+                    manifest_url = r2_upload(local_manifest_path, manifest_key)
+                    manifest_elapsed = time.perf_counter() - manifest_t0
+                    origin = "cache" if manifest_meta.get("cache_hit") else "fresh"
+                    print(f"[probe ]  manifest ready ({origin}) in {manifest_elapsed:.2f}s — "
+                          f"{len(per_frame_bboxes)} per-frame bboxes (legacy bbox-only path); "
+                          f"set_hash={manifest_meta.get('set_hash')}")
+                    print(f"[upload]  manifest uploaded to R2 ({manifest_key})")
+                else:
+                    print(f"[probe ]  computing/loading v3 FULL manifest "
+                          f"(per-frame bbox + latents + parsing) for "
+                          f"{len(unique_clip_paths)} unique clip(s) ...")
+                    bboxes_urls, latents_urls, parsing_urls, manifest_meta = (
+                        get_or_compute_full_manifest(
+                            unique_clips=unique_clip_paths,
+                            frame_to_clip=frame_to_clip,
+                            frame_to_clip_idx=build_meta["frame_to_clip_idx"],
+                            bbox_shift=args.bbox_shift,
+                            extra_margin=args.extra_margin,
+                            parsing_mode=args.parsing_mode,
+                            left_cheek_width=args.left_cheek_width,
+                            right_cheek_width=args.right_cheek_width,
+                            cache_dir=args.manifest_cache_dir,
+                            poll_timeout=args.preprocess_timeout_seconds,
+                        )
+                    )
+                    manifest_elapsed = time.perf_counter() - manifest_t0
+                    origin = "cache" if manifest_meta.get("cache_hit") else "fresh"
+                    print(f"[probe ]  v3 manifest ready ({origin}) in {manifest_elapsed:.2f}s — "
+                          f"{len(latents_urls)} latents + {len(parsing_urls)} parsing + "
+                          f"{len(bboxes_urls)} bbox blobs; "
+                          f"full_set_hash={manifest_meta.get('full_set_hash')}")
 
-        upload_t0 = time.perf_counter()
-        video_url = r2_upload(intermediate, video_key)
-        audio_url = r2_upload(args.audio, audio_key)
-        upload_elapsed = time.perf_counter() - upload_t0
-        print(f"[upload]  R2 inputs ready in {upload_elapsed:.2f}s "
-              f"(video={video_key}, audio={audio_key})")
+            upload_t0 = time.perf_counter()
+            video_url = r2_upload(intermediate, video_key)
+            audio_url = r2_upload(args.audio, audio_key)
+            upload_elapsed = time.perf_counter() - upload_t0
+            print(f"[upload]  R2 inputs ready in {upload_elapsed:.2f}s "
+                  f"(video={video_key}, audio={audio_key})")
 
-        input_payload = {
-            "video_url": video_url,
-            "audio_url": audio_url,
-            "output_object_key": output_key,
-            "enhance": args.enhance,
-            "bbox_shift": args.bbox_shift,
-            "extra_margin": args.extra_margin,
-            "parsing_mode": args.parsing_mode,
-            "left_cheek_width": args.left_cheek_width,
-            "right_cheek_width": args.right_cheek_width,
-            "fps": args.fps,
-            "batch_size": args.batch_size,
-            "gfpgan_weight": args.gfpgan_weight,
-        }
-        if manifest_url:
-            input_payload["manifest_url"] = manifest_url
-        if bboxes_urls and latents_urls and parsing_urls:
-            input_payload["bboxes_urls"] = bboxes_urls
-            input_payload["latents_urls"] = latents_urls
-            input_payload["parsing_urls"] = parsing_urls
-            input_payload["frame_to_clip"] = [
-                Path(p).name for p in build_meta["frame_to_clip"]
-            ]
-            input_payload["frame_to_clip_idx"] = build_meta["frame_to_clip_idx"]
-        job_id = submit_job(input_payload)
-        print(f"[submit]  RunPod job_id={job_id}")
+            input_payload = {
+                "video_url": video_url,
+                "audio_url": audio_url,
+                "output_object_key": output_key,
+                "enhance": args.enhance,
+                "bbox_shift": args.bbox_shift,
+                "extra_margin": args.extra_margin,
+                "parsing_mode": args.parsing_mode,
+                "left_cheek_width": args.left_cheek_width,
+                "right_cheek_width": args.right_cheek_width,
+                "fps": args.fps,
+                "batch_size": args.batch_size,
+                "gfpgan_weight": args.gfpgan_weight,
+            }
+            if manifest_url:
+                input_payload["manifest_url"] = manifest_url
+            if bboxes_urls and latents_urls and parsing_urls:
+                input_payload["bboxes_urls"] = bboxes_urls
+                input_payload["latents_urls"] = latents_urls
+                input_payload["parsing_urls"] = parsing_urls
+                input_payload["frame_to_clip"] = [
+                    Path(p).name for p in build_meta["frame_to_clip"]
+                ]
+                input_payload["frame_to_clip_idx"] = build_meta["frame_to_clip_idx"]
+            job_id = submit_job(input_payload)
+            print(f"[submit]  RunPod job_id={job_id}")
 
-        job_result = poll_job(job_id, timeout_seconds=args.api_timeout_seconds)
+            job_result = poll_job(job_id, timeout_seconds=args.api_timeout_seconds)
 
-        if job_result.get("status") != "COMPLETED":
-            detail = (job_result.get("output") or {}).get("detail")
-            trace = (job_result.get("output") or {}).get("trace")
-            print(f"ERROR: RunPod job ended with status={job_result.get('status')}",
-                  file=sys.stderr)
-            if detail:
-                print(f"  detail: {detail}", file=sys.stderr)
-            if trace:
-                print(trace, file=sys.stderr)
+            if job_result.get("status") != "COMPLETED":
+                detail = (job_result.get("output") or {}).get("detail")
+                trace = (job_result.get("output") or {}).get("trace")
+                print(f"ERROR: RunPod job ended with status={job_result.get('status')}",
+                      file=sys.stderr)
+                if detail:
+                    print(f"  detail: {detail}", file=sys.stderr)
+                if trace:
+                    print(trace, file=sys.stderr)
+                return 4
+
+            handler_output = job_result.get("output") or {}
+            if handler_output.get("status") != "success":
+                print(f"ERROR: handler returned non-success payload: {handler_output}",
+                      file=sys.stderr)
+                return 4
+
+            result_output_url = handler_output["output_url"]
+            download_t0 = time.perf_counter()
+            r2_download(result_output_url, args.output)
+            download_elapsed = time.perf_counter() - download_t0
+            print(f"[dload ]  output downloaded in {download_elapsed:.2f}s")
+
+        except RunPodClientError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            if args.batch_size > 4:
+                print("HINT: if VRAM is the issue, retry with --batch-size 4", file=sys.stderr)
             return 4
-
-        handler_output = job_result.get("output") or {}
-        if handler_output.get("status") != "success":
-            print(f"ERROR: handler returned non-success payload: {handler_output}",
-                  file=sys.stderr)
-            return 4
-
-        result_output_url = handler_output["output_url"]
-        download_t0 = time.perf_counter()
-        r2_download(result_output_url, args.output)
-        download_elapsed = time.perf_counter() - download_t0
-        print(f"[dload ]  output downloaded in {download_elapsed:.2f}s")
-
-    except RunPodClientError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        if args.batch_size > 4:
-            print("HINT: if VRAM is the issue, retry with --batch-size 4", file=sys.stderr)
-        return 4
 
     end_pc = time.perf_counter()
     end_dt = datetime.now()
@@ -329,30 +371,45 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[output]  {args.output.resolve()}")
 
     metadata_path = args.output.with_suffix(".json")
-    metadata = {
-        "params": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
-        "run_id": run_id,
-        "build_phase": build_meta,
-        "lipsync_phase": {
-            "backend": "runpod_serverless",
+    lipsync_phase: dict = {
+        "backend": "runpod_serverless" if args.backend == "runpod" else "local_inprocess",
+        "start_iso": start_dt.isoformat(),
+        "end_iso": end_dt.isoformat(),
+        "elapsed_seconds": elapsed,
+        "elapsed_minutes": elapsed / 60,
+        "elapsed_hms": _format_elapsed(elapsed),
+        "manifest": manifest_meta,
+    }
+    if args.backend == "runpod":
+        lipsync_phase.update({
             "runpod_job_id": job_id,
             "runpod_status": job_result.get("status"),
             "runpod_execution_time_seconds": api_processing_time,
             "runpod_queue_delay_seconds": delay_time,
-            "start_iso": start_dt.isoformat(),
-            "end_iso": end_dt.isoformat(),
-            "elapsed_seconds": elapsed,
-            "elapsed_minutes": elapsed / 60,
-            "elapsed_hms": _format_elapsed(elapsed),
             "r2_keys": {
                 "video": video_key,
                 "audio": audio_key,
                 "output": output_key,
                 "manifest": manifest_key if manifest_url else None,
             },
-            "manifest": manifest_meta,
             "runpod_response": job_result,
-        },
+        })
+    else:  # local
+        engine_output = job_result.get("output") or {}
+        lipsync_phase.update({
+            "local_execution_time_seconds": (
+                job_result.get("executionTime", 0) / 1000.0
+                if job_result.get("executionTime") else None
+            ),
+            "local_total_elapsed_s": engine_output.get("total_elapsed_s"),
+            "local_response": job_result,
+        })
+
+    metadata = {
+        "params": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+        "run_id": run_id,
+        "build_phase": build_meta,
+        "lipsync_phase": lipsync_phase,
         "output_path": str(args.output.resolve()),
     }
     metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
@@ -364,7 +421,7 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
 
-    if not args.keep_r2_objects:
+    if args.backend == "runpod" and not args.keep_r2_objects:
         keys_to_delete = [video_key, audio_key, output_key]
         if manifest_url:
             keys_to_delete.append(manifest_key)
