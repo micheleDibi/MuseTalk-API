@@ -293,10 +293,19 @@ Il client:
 │        │     Phase C: bbox (SKIP se precomputed)                  │      │
 │        │     Phase D: VAE encode (SKIP se precomputed)            │      │
 │        │     Phase E: UNet inference (batch=16)                   │      │
-│        │     Phase F: blending (precomputed_mask se cache)        │      │
-│        │     Phase G: ffmpeg pipe stdin                           │      │
-│        │              h264_nvenc cq=18 +3M floor (libx264 cq=16   │      │
-│        │              come fallback se nvenc non disponibile)     │      │
+│        │     Phase F: maschere (precomputed_mask se cache,        │      │
+│        │              altrimenti BiSeNet nel padre)               │      │
+│        │     Phase F+G: fusione + encode, n_workers processi      │      │
+│        │       (musetalk/utils/fusione_parallela.py)              │      │
+│        │       n_workers=1 -> ciclo storico + un solo ffmpeg      │      │
+│        │       n_workers>1 -> N segmenti contigui, un fork per    │      │
+│        │         segmento: blend + ffmpeg pipe stdin in           │      │
+│        │         streaming su seg_NNN.mp4, poi concat demuxer     │      │
+│        │         -c copy (nessuna ricodifica)                     │      │
+│        │       codec uniforme: h264_nvenc cq=18 +3M floor se      │      │
+│        │         la sonda passa (max MUSETALK_NVENC_SESSIONS      │      │
+│        │         segmenti), altrimenti libx264 crf=16             │      │
+│        │       parallelo fallito -> ripiego sul sequenziale       │      │
 │        │     mux audio AAC                                        │      │
 │        └──────────────────────────────────────────────────────────┘      │
 │                                                                          │
@@ -322,6 +331,7 @@ Il client:
 | `musetalk/utils/preprocessing.py` | `get_landmark_and_bbox` (s3fd + DWPose). |
 | `musetalk/utils/audio_processor.py` | Whisper feature extraction + chunking per frame. |
 | `musetalk/utils/blending.py` | `get_image` (blend con FaceParsing mask). |
+| `musetalk/utils/fusione_parallela.py` | Fasi F e G: percorso sequenziale storico e percorso a segmenti (fork + concat `-c copy`). Senza torch. |
 | `musetalk/utils/face_parsing/__init__.py` | BiSeNet wrapper con `batch_call`. |
 | `musetalk/models/vae.py` | VAE wrapper con `preprocess_img_batch` + `get_latents_for_unet_batch`. |
 | `musetalk/models/unet.py` | UNet wrapper. |
@@ -883,6 +893,9 @@ disponibile per chi privilegia nitidezza del volto sul tempo.
 
 ### 6.2 Phase-by-phase su cache hit (v6+, valori medi)
 
+Profilo **misurato** del percorso sequenziale (`n_workers=1`), che resta
+disponibile come riferimento:
+
 | Fase | Tempo | Note |
 |---|---|---|
 | Download cache blobs (5 clip) | ~5-10 s | dipende dalla connessione R2→worker |
@@ -896,6 +909,134 @@ disponibile per chi privilegia nitidezza del volto sul tempo.
 | **Phase G** video encode | 200 s | libx264 (NVENC non disponibile su H100) |
 | **Phase G** audio mux | 3 s | AAC encode |
 | **Totale engine.generate** | ~830-850 s | ≈ 14 min |
+
+#### 6.2.1 Fasi F e G parallele
+
+Il 70% del tempo qui sopra è in F+G, che usavano un solo core. Dal modulo
+`musetalk/utils/fusione_parallela.py` (senza torch, testabile senza GPU):
+
+- I frame vengono divisi in **N segmenti contigui** (`n_seg = min(n_workers,
+  n_frame // 250)`, lunghezze bilanciate, mai sotto 3 frame). Ogni segmento è
+  affidato a un processo creato con `fork` che fonde i propri frame e li invia
+  **in streaming** al proprio ffmpeg (`seg_NNN.mp4`): il buffer
+  `combine_frames` (~42 GB) nel percorso parallelo non esiste.
+- Il padre verifica che i segmenti siano **uniformi** (codec, profilo, livello,
+  geometria, `time_base`, `has_b_frames`, hash dell'avcC, numero di frame),
+  li concatena con il concat demuxer in `-c copy` e controlla pacchetti e durata
+  del risultato. Il mux dell'audio è invariato. Nella lista ogni riga `file` è
+  seguita dalla `duration` esatta al microsecondo: senza, ffmpeg ≤ 5.1 (nelle
+  immagini c'è la 4.4) userebbe la durata del contenitore mp4, arrotondata al
+  millisecondo, e a 24/30/60 fps ogni confine slitterebbe di una frazione di
+  millisecondo. Con ffmpeg ≥ 6 il file prodotto è identico al byte.
+- **Perché fork e non spawn + shared_memory**: con spawn il figlio ri-esegue
+  `__main__` (in `handler.py` i modelli si caricano a livello di modulo) e i
+  frame andrebbero copiati in `/dev/shm`, non dimensionabile su RunPod
+  Serverless. Con fork gli argomenti sono ereditati, mai serializzati, e i
+  buffer numpy si leggono in copy-on-write. I figli non toccano torch/CUDA, non
+  stampano, ed escono con `os._exit`.
+- **GFPGAN** (`enhance=True`) resta sulla GPU del padre: nel percorso parallelo
+  è un passaggio preliminare sequenziale, prima dei fork, che produce una lista
+  nuova di facce; da lì in poi nessuno lo richiama (nemmeno il ripiego).
+- **Senza cache** BiSeNet resta nel padre come prima; i ritagli PIL si
+  costruiscono a lotti e su cache hit non si costruiscono più (erano lavoro
+  inutile: ~14 GB e una parte seriale rilevante della fase F).
+- **NVENC**: una sonda nel padre apre `MUSETALK_NVENC_SESSIONS` encode minuscoli
+  in contemporanea. Se passa, i segmenti sono al più quante le sessioni (il
+  blending è quindi parallelo solo S volte: con NVENC disponibile
+  `use_nvenc=False` può risultare più veloce). Se un segmento nvenc fallisce si
+  rifà **tutto** in libx264: il codec è sempre uniforme dentro un video, perché
+  ffmpeg concatena in silenzio anche segmenti difformi.
+- **Fallimento** del percorso parallelo (fork, worker morto, stallo, segmenti
+  difformi, conteggio frame): riga `[phase F] PARALLELO FALLITO (...)` e ripiego
+  sul percorso sequenziale, così il job termina comunque.
+- Il bitstream mp4 **non** è identico al bit fra `n_workers=1` e `n_workers=N`
+  (GOP e rate control ripartono a ogni segmento). La parità è definita sui frame
+  in uscita dalla fase F (sha256 identici) e su numero di frame, fps e durata.
+
+Log: le righe `[phase F] blending: N frames in X.XXs` e `[phase G] video
+encode: X.XXs` restano nel formato di prima. In parallelo la prima misura
+fusione+codifica sovrapposte (passaggio GFPGAN e sonda NVENC compresi), la
+seconda verifica dei segmenti e concat. Si aggiunge sempre una riga:
+
+```
+[phase F+G] modo=parallelo n_workers=16 segmenti=16 codec=libx264 x264_threads=2
+  fork_ms=min/mediana/max tentativi=1 cpu(slurm=..,affinity=..,cgroup=..,os=..)->N
+  motivo='auto' prepass_gfpgan=0.00s uniformita=OK rss_fork=52.3GB
+  fusione_cpu=410.2s seg_max=38.1s
+```
+
+(su una riga sola; nel percorso sequenziale si ferma a `motivo=`, che dice
+perché non si è andati in parallelo). `cpu(...)->N` sono i valori grezzi e le
+CPU effettive che ne derivano; `fusione_cpu` è la somma del tempo di fusione di
+tutti i worker (≈ la vecchia fase F senza preparazione), `seg_max` il segmento
+più lento: `seg_max` molto maggiore di `fusione_cpu / segmenti` significa che i
+worker aspettano x264 e conviene alzare i thread o ridurre i worker. Gli avvisi
+e gli errori di ffmpeg dei segmenti vengono riportati sullo stderr del job
+(`[phase G] seg_NNN.ffmpeg.log:`).
+
+| Variabile | Default | Effetto |
+|---|---|---|
+| `MUSETALK_BLEND_WORKERS` | automatico | Numero di processi. `1` = percorso sequenziale (interruttore di emergenza, senza rebuild); anche un valore non valido (`0`, refuso) spegne il parallelo. Il parametro `n_workers` di `generate()` ha la precedenza. |
+| `MUSETALK_NVENC_SESSIONS` | 2 | Sessioni h264_nvenc concorrenti (= segmenti con NVENC). |
+| `MUSETALK_X264_THREADS` | `cpu // n_seg`, max 8 | Thread di libx264 per segmento. |
+| `MUSETALK_FG_STRICT` | off | `1` = nessun ripiego: il fallimento del parallelo solleva, e solleva anche se il parallelo era stato chiesto in modo esplicito (parametro o env) ma non è praticabile. Per test e validazione. |
+| `MUSETALK_FG_VERIFICA` | off | `1` = dopo il parallelo rifonde tutti i frame nel padre e confronta gli sha256 (`[phase F] verifica parita: OK/KO`). Costa quanto una fase F sequenziale. |
+| `MUSETALK_FG_STALLO_S` | 300 | Secondi senza avanzamento prima di dichiarare lo stallo. |
+
+Il default automatico è `min(16, cpu_effettive // 2)`, solo su Linux, dove
+`cpu_effettive = min(SLURM_CPUS_PER_TASK, affinity, quota cgroup, os.cpu_count())`:
+`os.cpu_count()` da solo ignora SLURM e i limiti dei container. Si divide per
+due perché ogni worker pilota anche un ffmpeg. Con il template SLURM attuale
+(`--cpus-per-task=8`) i worker sono 4; su MN5 ACC conviene chiedere 20 core per
+GPU (i template non sono stati modificati).
+
+**Tempi attesi di F+G — STIME NON MISURATE** sull'hardware di destinazione.
+Ipotesi: 23 599 frame 768×768, cache hit, x264 `-preset slow` ≈ 90 ms per
+vCPU-frame (intervallo 50-130), fork 0,2-0,85 s per figlio. Vanno sostituite
+con i numeri reali della riga `[phase F+G]` al primo job.
+
+| Scenario | F+G | Nota |
+|---|---|---|
+| Sequenziale, H100 SXM (**misurato**) | 590-600 s | riferimento, tabella sopra |
+| 8 vCPU (template SLURM attuale) | ~220-460 s *(stima)* | 4 worker × 2 thread |
+| 16-20 vCPU | ~95-195 s *(stima)* | |
+| 32 vCPU | ~60-125 s *(stima)* | 16 worker × 2 thread; la fase E diventa il collo di bottiglia |
+| 72 vCPU | ~32-65 s *(stima)* | 16 worker × 4 thread |
+| `enhance=True`, 32 vCPU | ~360 s + ~90 s *(stima)* | il passaggio GFPGAN resta seriale: guadagno ~2× |
+| NVENC con 2 sessioni | ~200 s *(stima)* | blending solo 2 volte parallelo |
+
+Uniche misure disponibili, **non rappresentative** dell'hardware di produzione
+(MacBook 8 core, numpy 1.24, ffmpeg 7.1, 1 500 frame 768×768 sintetici, 4
+worker × 2 thread x264, tempi senza il calcolo delle impronte):
+
+| Contenuto sintetico | Sequenziale (F + G) | Parallelo | Guadagno |
+|---|---|---|---|
+| comprimibile, ~1,8 Mbps | 24,1 s (8,8 + 15,3) | 20,2 s | ×1,19 |
+| rumore leggero | 33,9 s (8,7 + 25,3) | 30,7 s | ×1,11 |
+| sfondo rumoroso, ~25 Mbps | 130,9 s (9,0 + 121,9) | 125,6 s | ×1,04 |
+
+Su quella macchina la fase G domina e x264 satura già tutti gli 8 core nel
+percorso sequenziale: dividere in segmenti non crea capacità che non c'è. Il
+guadagno atteso in produzione viene da due condizioni da **verificare sul
+posto**, non dimostrate qui: che la fase F pesi molto più della G (395 s contro
+200 s, l'opposto del Mac) e che restino core liberi, cioè che la G di oggi sia
+limitata dal processo Python che alimenta ffmpeg (`tobytes` su array a stride
+negativo: ~5 ms a frame) o dal fatto che x264 a 768×768 non scala oltre una
+quindicina di thread. Lo misura `python tests/verifica_fusione_parallela.py`,
+che stampa anche gli fps di x264 lasciato libero e il costo di `tobytes`.
+
+**RAM** (stima): picco di oggi ~107-117 GB (frame 42 + `combine_frames` 42 +
+ritagli PIL 14 + facce e maschere ~10); in parallelo ~55-60 GB, più ~0,13 GB di
+page table per figlio.
+
+**Verifica**: `python -m unittest tests.test_fusione_parallela
+tests.test_generate_cablaggio` gira senza GPU e senza torch (su macOS con
+`OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`), anche dentro le immagini montando
+`tests/`. Non è verificabile senza GPU: il fork da un padre con contesto CUDA e
+i thread dell'SDK RunPod, NVENC reale, GFPGAN e BiSeNet veri, ffmpeg 4.4 e il
+backend pthreads di OpenCV su Linux. Per questo il primo job reale va lanciato
+con `MUSETALK_FG_VERIFICA=1 MUSETALK_FG_STRICT=1`: il confronto avviene dentro
+lo stesso job perché la fase E non è riproducibile al bit fra job diversi.
 
 ### 6.3 Costo cloud per run (15 min audio)
 
@@ -960,10 +1101,13 @@ giorni consigliato.
 - `scripts/client/clip_manifest.py:280-410` — `get_or_compute_full_manifest`
 - `scripts/client/synth_random_lipsync.py` — entry-point CLI
 
-**Engine** (immagine RunPod v7, immutata):
-- `api/inference_service.py:182-454` — `MuseTalkInference.generate`
-- `musetalk_runpod/handler.py:113-237` — `_handle_preprocess_full`
-- `musetalk_runpod/handler.py:286-385` — `_handle_lipsync`
+**Engine** (l'immagine RunPod `v7` contiene ancora le fasi F e G sequenziali:
+la parallelizzazione di §6.2.1 richiede il rebuild delle immagini Docker e
+Singularity):
+- `api/inference_service.py` — `MuseTalkInference.generate`
+- `musetalk/utils/fusione_parallela.py` — fasi F e G (`fondi_e_codifica`)
+- `musetalk_runpod/handler.py` — `_handle_preprocess_full`,
+  `_expand_cached_per_clip`, `_handle_lipsync`
 
 **Versioning duale**:
 - **Script client**: versionato in questo documento (v0...v8). Cambia ad

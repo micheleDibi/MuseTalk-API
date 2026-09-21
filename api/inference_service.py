@@ -11,65 +11,18 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import WhisperModel
 
-from musetalk.utils.blending import get_image, _build_blend_mask_from_parsing, get_crop_box
+from musetalk.utils.blending import _build_blend_mask_from_parsing, get_crop_box
 from musetalk.utils.face_parsing import FaceParsing
 from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.utils import get_file_type, datagen, load_all_model
 from musetalk.utils.preprocessing import get_landmark_and_bbox, coord_placeholder
-
-
-def _write_video_pipe(
-    frames: List[np.ndarray],
-    output_path: str,
-    width: int,
-    height: int,
-    fps: int,
-    codec: str = "h264_nvenc",
-) -> None:
-    """Pipe uint8 BGR frames through ffmpeg's stdin into ``output_path``.
-
-    Avoids writing PNG intermediates to disk. Raises ``CalledProcessError`` on
-    non-zero ffmpeg exit so the caller can fall back to libx264.
-    """
-    if codec == "h264_nvenc":
-        encoder_args = [
-            "-c:v", "h264_nvenc",
-            "-preset", "p5",
-            "-rc", "vbr",
-            "-cq", "18",
-            "-b:v", "3M",
-            "-maxrate", "5M",
-            "-bufsize", "10M",
-            "-pix_fmt", "yuv420p",
-        ]
-    else:
-        encoder_args = [
-            "-c:v", codec,
-            "-preset", "slow",
-            "-crf", "16",
-            "-pix_fmt", "yuv420p",
-        ]
-
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-        "-f", "rawvideo",
-        "-pix_fmt", "bgr24",
-        "-s", f"{width}x{height}",
-        "-r", str(fps),
-        "-i", "-",
-        *encoder_args,
-        output_path,
-    ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-    try:
-        for frame in frames:
-            proc.stdin.write(frame.tobytes())
-        proc.stdin.close()
-    except BrokenPipeError:
-        pass
-    ret = proc.wait()
-    if ret != 0:
-        raise subprocess.CalledProcessError(ret, cmd)
+# Le fasi F e G vivono in un modulo senza torch, testabile senza GPU.
+# ``_write_video_pipe`` resta importabile da qui come prima.
+from musetalk.utils.fusione_parallela import (  # noqa: F401
+    ContestoFusione,
+    _write_video_pipe,
+    fondi_e_codifica,
+)
 
 
 class MuseTalkInference:
@@ -191,6 +144,11 @@ class MuseTalkInference:
 
         return face_crop
 
+    def _sincronizza_gpu(self) -> None:
+        """Nessun kernel CUDA in volo al momento dei fork delle fasi F e G."""
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
     @torch.no_grad()
     def generate(
         self,
@@ -213,7 +171,11 @@ class MuseTalkInference:
         use_nvenc: bool = True,
         vae_batch_size: int = 16,
         parsing_batch_size: int = 16,
+        n_workers: Optional[int] = None,
     ) -> str:
+        # n_workers: processi per fusione + codifica (fasi F e G). None = env
+        # MUSETALK_BLEND_WORKERS oppure dimensionamento automatico; 1 = percorso
+        # sequenziale storico.
         if not self.models_loaded:
             self.load_models()
 
@@ -374,11 +336,10 @@ class MuseTalkInference:
             self._load_gfpgan()
 
         n_blend = len(res_frame_list)
+        # face_boxes[i] is None  <=>  frame senza volto (placeholder): e' l'unica
+        # informazione sulle bbox che serve a fusione_parallela.
         face_boxes: List[Optional[tuple]] = [None] * n_blend
         crop_boxes: List[Optional[tuple]] = [None] * n_blend
-        ori_shapes: List[Optional[tuple]] = [None] * n_blend
-        face_large_pil_list: List[Optional[Image.Image]] = [None] * n_blend
-        ori_frames_for_blend: List[Optional[np.ndarray]] = [None] * n_blend
 
         for i in range(n_blend):
             bbox = coord_list_cycle[i % len(coord_list_cycle)]
@@ -391,82 +352,66 @@ class MuseTalkInference:
             crop_box, _ = get_crop_box(face_box, 1.5)
             face_boxes[i] = face_box
             crop_boxes[i] = crop_box
-            ori_frames_for_blend[i] = ori_frame
-            # face_large is BGR->RGB PIL, cropped on the expanded box
-            body_pil = Image.fromarray(ori_frame[:, :, ::-1])
-            face_large_pil = body_pil.crop(crop_box)
-            face_large_pil_list[i] = face_large_pil
-            ori_shapes[i] = face_large_pil.size
 
         if precomputed_masks_cycle is None:
             fp = FaceParsing(
                 left_cheek_width=left_cheek_width, right_cheek_width=right_cheek_width
             )
             blend_masks: List[Optional[np.ndarray]] = [None] * n_blend
-            valid_idx = [i for i in range(n_blend) if face_large_pil_list[i] is not None]
+            valid_idx = [i for i in range(n_blend) if face_boxes[i] is not None]
             for start in range(0, len(valid_idx), parsing_batch_size):
                 batch_idx = valid_idx[start:start + parsing_batch_size]
-                batch_imgs = [face_large_pil_list[i] for i in batch_idx]
+                # I ritagli PIL servono solo al parsing: si costruiscono a lotti,
+                # cosi' non restano in memoria per tutti i frame (e su cache hit
+                # non si costruiscono affatto).
+                batch_imgs = []
+                for i in batch_idx:
+                    ori_frame = frame_list_cycle[i % len(frame_list_cycle)]
+                    # face_large is BGR->RGB PIL, cropped on the expanded box
+                    body_pil = Image.fromarray(ori_frame[:, :, ::-1])
+                    batch_imgs.append(body_pil.crop(crop_boxes[i]))
                 parsing_results = fp.batch_call(batch_imgs, mode=parsing_mode)
                 for i_local, i_global in enumerate(batch_idx):
-                    parsing_pil = parsing_results[i_local].resize(ori_shapes[i_global])
+                    ori_shape = batch_imgs[i_local].size
+                    parsing_pil = parsing_results[i_local].resize(ori_shape)
                     blend_masks[i_global] = _build_blend_mask_from_parsing(
                         parsing_pil,
                         face_boxes[i_global],
                         crop_boxes[i_global],
-                        ori_shapes[i_global],
+                        ori_shape,
                     )
         else:
             blend_masks = precomputed_masks_cycle
             fp = None
 
-        combine_frames: List[np.ndarray] = []
-        for i, res_frame in enumerate(tqdm(res_frame_list, desc="Blending")):
-            bbox = coord_list_cycle[i % len(coord_list_cycle)]
-            if bbox == coord_placeholder:
-                combine_frames.append(frame_list_cycle[i % len(frame_list_cycle)])
-                continue
-            x1, y1, x2, y2c = face_boxes[i]
-            ori_frame = ori_frames_for_blend[i].copy()
-
-            face_crop = res_frame.astype(np.uint8)
-            if enhance:
-                face_crop = self._enhance_face_aligned(face_crop, gfpgan_weight)
-            try:
-                face_resized = cv2.resize(face_crop, (x2 - x1, y2c - y1))
-            except Exception:
-                combine_frames.append(ori_frame)
-                continue
-
-            combine_frame = get_image(
-                ori_frame,
-                face_resized,
-                [x1, y1, x2, y2c],
-                mode=parsing_mode,
-                fp=fp,
-                precomputed_mask=blend_masks[i],
-            )
-            combine_frames.append(combine_frame)
-        print(f"[phase F] blending: {len(combine_frames)} frames in {time.perf_counter() - t0:.2f}s")
-
-        # ---- Phase G: ffmpeg encode (pipe stdin, h264_nvenc with fallback) ---
-        t0 = time.perf_counter()
+        # ---- Phase F + G: fusione e codifica (sequenziale o a segmenti) -------
+        # Con n_workers == 1 si percorre il ciclo storico e un solo ffmpeg; con
+        # piu' worker ogni processo figlio fonde e codifica il proprio segmento e
+        # il padre concatena in -c copy. GFPGAN resta sulla GPU del padre: nel
+        # percorso parallelo diventa un passaggio preliminare, prima dei fork.
+        # Le righe "[phase F]" e "[phase G]" le stampa fondi_e_codifica.
         temp_vid_path = os.path.join(temp_dir, f"temp_{input_basename}_{audio_basename}.mp4")
-        h, w = combine_frames[0].shape[:2]
-
-        encoded_ok = False
-        if use_nvenc:
-            try:
-                _write_video_pipe(combine_frames, temp_vid_path, w, h, fps, codec="h264_nvenc")
-                encoded_ok = True
-            except subprocess.CalledProcessError as e:
-                print(f"[phase G] h264_nvenc failed (rc={e.returncode}); fallback to libx264")
-            except FileNotFoundError:
-                print("[phase G] ffmpeg not found in PATH; cannot encode")
-                raise
-        if not encoded_ok:
-            _write_video_pipe(combine_frames, temp_vid_path, w, h, fps, codec="libx264")
-        print(f"[phase G] video encode: {time.perf_counter() - t0:.2f}s")
+        migliora = None
+        if enhance:
+            migliora = lambda faccia: self._enhance_face_aligned(faccia, gfpgan_weight)  # noqa: E731
+        fondi_e_codifica(
+            ContestoFusione(
+                facce=res_frame_list,
+                frame_ciclo=frame_list_cycle,
+                face_boxes=face_boxes,
+                maschere=blend_masks,
+                parsing_mode=parsing_mode,
+                fp=fp,
+            ),
+            temp_vid_path,
+            fps,
+            use_nvenc=use_nvenc,
+            n_workers=n_workers,
+            dir_lavoro=temp_dir,
+            migliora=migliora,
+            prima_del_fork=self._sincronizza_gpu,
+            t_inizio_fase_f=t0,
+        )
 
         # mux audio (copy video stream, encode audio to AAC)
         t0 = time.perf_counter()
